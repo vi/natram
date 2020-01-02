@@ -7,9 +7,11 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-serde = "1.0.104"
+serde = {version="1.0.104",features=["derive"]}
 serde_cbor = "0.10.2"
 structopt = {default_features=false, version="0.3.7"}
+slab = "0.4.2"
+ttl_cache = "0.5.1"
 
 [dependencies.tokio]
 version="0.2.6"

@@ -1,7 +1,7 @@
 #![allow(unused)]
 
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(structopt::StructOpt)]
 struct Opt {
@@ -44,8 +44,84 @@ struct Opt {
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+const MAX_NAMES : usize = 1024;
+const MAX_ADDRS: usize = 16;
+const NAME_EXPIRE_SECONDS : u64 = 120;
+const ADDR_EXPIRE_SECONDS : u64 = 120;
+
+use serde::{Serialize,Deserialize};
+use serde_cbor::{Value as CborValue};
+
+const IP_MASK : u32 = 0x44556677;
+const PORT_MASK : u16 = 0x8899;
+
 async fn server(sa: SocketAddr) -> Result<!> {
-    unimplemented!()
+    use ttl_cache::TtlCache;
+
+    type Registry = TtlCache<String, TtlCache<SocketAddr, ()>>;
+    let mut registry : Registry = TtlCache::new(MAX_NAMES);
+
+    /// Server's view on control message.
+    #[derive(Serialize, Deserialize)]
+    struct ControlMessage {
+        na : String,
+        ip : Option<u32>,
+        po : Option<u16>,
+        /// client fields are hidden here.
+        #[serde(flatten)]
+        _rest: CborValue,
+    }
+
+    let mut u = tokio::net::UdpSocket::bind(sa).await?;
+
+    let mut buf = [0u8; 2048];
+
+    async fn handle_packet(registry: &mut Registry, u: &mut tokio::net::UdpSocket, b : &[u8], from: SocketAddr) -> Result<()> {
+        let mut p : ControlMessage = serde_cbor::from_slice(b)?;
+        p.ip = Some(match from.ip() {
+            std::net::IpAddr::V4(a) => Into::<u32>::into(a) ^ IP_MASK,
+            std::net::IpAddr::V6(_) => 0 ^ IP_MASK,
+        });
+        p.po = Some(from.port() & PORT_MASK);
+        let v = serde_cbor::to_vec(&p)?;
+
+        if p.na == "" {
+            // Just send this back. Act as poor man's STUN.
+            u.send_to(&v[..], from).await?;
+            return Ok(());
+        }
+        
+        let mut addrs = registry.remove(&p.na).unwrap_or_else(||TtlCache::new(MAX_ADDRS));
+
+        // Broadcast this message (with filled in source address) to all other subscribed peers
+        for (x,()) in addrs.iter() {
+            if x == &from { continue }
+            let _ = u.send_to(&v[..], x).await;
+        }
+
+        addrs.insert(from, (), Duration::from_secs(ADDR_EXPIRE_SECONDS));
+
+        registry.insert(p.na, addrs, Duration::from_secs(NAME_EXPIRE_SECONDS));
+        Ok(())
+    }
+
+    let mut error_ratelimiter = Instant::now();
+    let mut maybereporterr = |e| {
+        if Instant::now() >= error_ratelimiter {
+            eprintln!("error: {}", e);
+            error_ratelimiter = Instant::now() + Duration::from_millis(50);
+        }
+    };
+    loop {
+        match u.recv_from(&mut buf[..]).await {
+            Ok((len, from)) => if let Err(e) = handle_packet(&mut registry, &mut u, &buf[0..len], from).await {
+                maybereporterr(e);
+            },
+            Err(e) => {
+                maybereporterr(Box::new(e));
+            },
+        }
+    }
 }
 
 async fn client(
