@@ -14,6 +14,7 @@ slab = "0.4.2"
 ttl_cache = "0.5.1"
 serde_yaml = "0.8.11"
 rand = "0.7.2"
+unzip3 = "1.0.0"
 
 [dependencies.tokio]
 version="0.2.6"

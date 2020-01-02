@@ -9,7 +9,7 @@ use tokio::net::UdpSocket;
 
 /// Options for client mode for communicating to other apps
 #[derive(StructOpt)]
-struct PlayloadCommunicationOptions {
+pub struct PlayloadCommunicationOptions {
     #[structopt(long, short = "b")]
     /// Bind to specified UDP port for actual communication.
     /// All incoming packets will be forwarded to the peer.
@@ -27,7 +27,7 @@ struct PlayloadCommunicationOptions {
 }
 
 #[derive(StructOpt)]
-struct ClientSettings {
+pub struct ClientSettings {
     /// Keep-alive interval for clients, in seconds
     #[structopt(long, short = "i", default_value = "30")]
     keepalive_interval: u64,
@@ -198,166 +198,14 @@ async fn server(sa: SocketAddr) -> Result<!> {
     }
 }
 
-async fn client(
-    sa: SocketAddr,
-    name: String,
-    pco: PlayloadCommunicationOptions,
-    cs: ClientSettings,
-) -> Result<!> {
-    use tokio::sync::mpsc::{channel, Sender, Receiver};
-    let bindaddr = if let Some(x) = pco.bind {
-        x
-    } else {
-        if let Some(SocketAddr::V4(st)) = pco.sendto {
-            if st.ip().is_loopback() {
-                "127.0.0.1:0".parse().unwrap()
-            } else {
-                "0.0.0.0:0".parse().unwrap()
-            }
-        } else {
-            "0.0.0.0:0".parse().unwrap()
-        }
-    };
-    let keepalive_interval = Duration::from_secs(cs.keepalive_interval);
-
-    /// Socket for communicating with server
-    let mut server = UdpSocket::bind("0.0.0.0:0".parse::<SocketAddr>().unwrap()).await?;
-    server.connect(sa).await?;
-
-    struct Port {
-        u : UdpSocket,
-        p : u16,
-        buddy: Option<SocketAddr>,
-    }
-
-    let mut sanity_limit : usize = 65536;
-    /// UDP sockets with random ports
-    let mut ports : Vec<Port> = Vec::with_capacity(cs.num_ports);
-
-    let mut rnd = rand::thread_rng();
-    use rand::RngCore;
-
-    loop {
-        let p : u16 = (rnd.next_u32() & 0xFFFF) as u16;
-        if p <= 1024 { continue }
-
-        let nullip = std::net::Ipv4Addr::UNSPECIFIED;
-        if let Ok(u) = UdpSocket::bind(SocketAddr::V4(std::net::SocketAddrV4::new(nullip, p))).await {
-            ports.push(Port { u, p, buddy: None});
-        }
-
-        if ports.len() == cs.num_ports { break; }
-
-        sanity_limit-=1;
-        if sanity_limit == 0 {
-            break;
-        }
-    }
-
-    // Not `cs.num_ports` UDP sockets should be created
-    if ports.is_empty() {
-        Err("Failed to open any ports for communication")?;
-    }
-
-    /// Control message as sent by client
-    #[derive(Serialize)]
-    struct OutgoingControlMessage {
-        /// Client name
-        na: String,
-        /// List of points we opened
-        ports: Vec<u16>,
-        /// Set to true for the first message to trigger early reply
-        disc: bool,
-    }
-
-    let mut advertisment = OutgoingControlMessage {
-        na: name,
-        ports: ports.iter().map(|pp|pp.p ^ PORT_MASK).collect(),
-        disc: true,
-    };
-    let mut advertisment_b = serde_cbor::to_vec(&advertisment)?;
-
-    #[derive(Deserialize,Debug)]
-    struct IncomingControlMessage {
-        na: String,
-        ip: u32,
-        po: u16,
-        ports: Vec<u16>,
-        disc: bool,
-    }
-
-    let (mut servrecv, mut servsend) = server.split();
-
-    /// Sender of messages to server
-    let (mut triggeradvsend, mut triggeradvsend_h) = channel::<()>(1);
-    let mut triggeradvsend2 = triggeradvsend.clone();
-
-    /// Handler of incoming adverts
-    tokio::spawn(async move {
-        loop {
-            let mut buf = [0u8; 2048];
-            let len = match servrecv.recv(&mut buf[..]).await {
-                Err(e) => {
-                    eprintln!("error receiving from server: {}", e);
-                    tokio::time::delay_for(Duration::from_millis(50)).await;
-                    continue
-                }
-                Ok(x) => x,
-            };
-            let msg : IncomingControlMessage = match serde_cbor::from_slice(&buf[0..len]) {
-                Err(e) => {
-                    eprintln!("Error decoding from server: {}", e);
-                    continue
-                }
-                Ok(x) => x,
-            };
-
-            if msg.disc {
-                let _ = triggeradvsend2.send(()).await;
-            }
-
-            eprintln!("Incoming message from server: {:?}", msg);
-
-            let peer_ip : std::net::Ipv4Addr = (msg.ip ^ IP_MASK).into();
-
-            let usable_ports_n = msg.ports.len().min(ports.len());
-
-
-
-            //todo!();
-        }
-    });
-
-    tokio::spawn(async move {
-        let mut first = true;
-        while let Some(()) = triggeradvsend_h.recv().await {
-            if let Err(e) = servsend.send(&advertisment_b[..]).await {
-                eprintln!("Error sending advert to server: {}", e);
-            }
-
-            if first {
-                first = false;
-                advertisment.disc = false;
-                advertisment_b = serde_cbor::to_vec(&advertisment).unwrap();
-            }
-        }
-    });
-
-    // Periodic sender of pings
-
-    let mut ticker = tokio::time::interval(Duration::from_secs(cs.keepalive_interval));
-    loop {
-        ticker.tick().await;
-        triggeradvsend.send(()).await?;
-    }
-}
+mod client;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     use structopt::StructOpt;
     let opt = Opt::from_args();
 
-    let mut modeopts = 0;
+    let mut modeopts : usize = 0;
     if opt.server.is_some() { modeopts += 1  }
     if opt.client.is_some() { modeopts += 1  }
     if opt.stats.is_some() { modeopts += 1  }
@@ -398,6 +246,6 @@ async fn main() -> Result<()> {
         let name = opt.name.unwrap();
         let sa = opt.client.unwrap();
 
-        client(sa, name, opt.pco, opt.cs).await?
+        client::client(sa, name, opt.pco, opt.cs).await?
     }
 }
