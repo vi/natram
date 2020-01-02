@@ -33,7 +33,7 @@ struct ClientSettings {
     keepalive_interval: u64,
 
     /// Number of ports to try
-    #[structopt(long,default_value="12")]
+    #[structopt(long, default_value = "12")]
     num_ports: u32,
 }
 
@@ -65,43 +65,73 @@ struct Opt {
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-const MAX_NAMES : usize = 1024;
+const MAX_NAMES: usize = 1024;
 const MAX_ADDRS: usize = 16;
-const NAME_EXPIRE_SECONDS : u64 = 120;
-const ADDR_EXPIRE_SECONDS : u64 = 120;
+const NAME_EXPIRE_SECONDS: u64 = 120;
+const ADDR_EXPIRE_SECONDS: u64 = 120;
 
-use serde::{Serialize,Deserialize};
-use serde_cbor::{Value as CborValue};
+use serde::{Deserialize, Serialize};
+use serde_cbor::Value as CborValue;
 
-const IP_MASK : u32 = 0x44556677;
-const PORT_MASK : u16 = 0x8899;
+const IP_MASK: u32 = 0x44556677;
+const PORT_MASK: u16 = 0x8899;
 
 async fn server(sa: SocketAddr) -> Result<!> {
     use ttl_cache::TtlCache;
 
     type Registry = TtlCache<String, TtlCache<SocketAddr, ()>>;
-    let mut registry : Registry = TtlCache::new(MAX_NAMES);
+    let mut registry: Registry = TtlCache::new(MAX_NAMES);
 
     /// Server's view on control message.
     #[derive(Serialize, Deserialize)]
     struct ControlMessage {
-        na : String,
-        ip : Option<u32>,
-        po : Option<u16>,
+        na: String,
+        ip: Option<u32>,
+        po: Option<u16>,
         /// client fields are hidden here.
         #[serde(flatten)]
         _rest: CborValue,
     }
 
+    #[derive(Serialize, Default)]
+    struct ServerMetrics {
+        pkt_rcv: u64,
+        han_err: u64,
+        rcv_err: u64,
+        zeropkt: u64,
+        me_rq: u64,
+        ping: u64,
+        named: u64,
+        newnm: u64,
+        sent: u64,
+        snderr: u64,
+    }
+
+    let mut metrics = ServerMetrics::default();
+
     let mut u = UdpSocket::bind(sa).await?;
 
     let mut buf = [0u8; 2048];
 
-    async fn handle_packet(registry: &mut Registry, u: &mut UdpSocket, b : &[u8], from: SocketAddr) -> Result<()> {
+    async fn handle_packet(
+        metrics: &mut ServerMetrics,
+        registry: &mut Registry,
+        u: &mut UdpSocket,
+        b: &[u8],
+        from: SocketAddr,
+    ) -> Result<()> {
         if b.len() == 0 {
+            metrics.zeropkt += 1;
             return Ok(());
         }
-        let mut p : ControlMessage = serde_cbor::from_slice(b)?;
+        if b.len() == 1 && b[0] == b'?' {
+            metrics.me_rq+=1;
+            let v = serde_cbor::to_vec(metrics)?;
+            u.send_to(&v[..], from).await?;
+            return Ok(());
+            // metrics request
+        }
+        let mut p: ControlMessage = serde_cbor::from_slice(b)?;
         p.ip = Some(match from.ip() {
             std::net::IpAddr::V4(a) => Into::<u32>::into(a) ^ IP_MASK,
             std::net::IpAddr::V6(_) => 0 ^ IP_MASK,
@@ -110,17 +140,25 @@ async fn server(sa: SocketAddr) -> Result<!> {
         let v = serde_cbor::to_vec(&p)?;
 
         if p.na == "" {
+            metrics.ping += 1;
             // Just send this back. Act as poor man's STUN.
             u.send_to(&v[..], from).await?;
             return Ok(());
         }
-        
-        let mut addrs = registry.remove(&p.na).unwrap_or_else(||TtlCache::new(MAX_ADDRS));
+        metrics.named += 1;
 
+        let mut addrs = registry
+            .remove(&p.na)
+            .unwrap_or_else(|| {metrics.newnm+=1; TtlCache::new(MAX_ADDRS)});
         // Broadcast this message (with filled in source address) to all other subscribed peers
-        for (x,()) in addrs.iter() {
-            if x == &from { continue }
-            let _ = u.send_to(&v[..], x).await;
+        for (x, ()) in addrs.iter() {
+            if x == &from {
+                continue;
+            }
+            match u.send_to(&v[..], x).await {
+                Ok(_) => metrics.sent += 1,
+                Err(_) => metrics.snderr += 1,
+            }
         }
 
         addrs.insert(from, (), Duration::from_secs(ADDR_EXPIRE_SECONDS));
@@ -138,12 +176,19 @@ async fn server(sa: SocketAddr) -> Result<!> {
     };
     loop {
         match u.recv_from(&mut buf[..]).await {
-            Ok((len, from)) => if let Err(e) = handle_packet(&mut registry, &mut u, &buf[0..len], from).await {
-                maybereporterr(e);
-            },
+            Ok((len, from)) => {
+                metrics.pkt_rcv+=1;
+                if let Err(e) =
+                    handle_packet(&mut metrics, &mut registry, &mut u, &buf[0..len], from).await
+                {
+                    metrics.han_err+=1;
+                    maybereporterr(e);
+                }
+            }
             Err(e) => {
+                metrics.rcv_err+=1;
                 maybereporterr(Box::new(e));
-            },
+            }
         }
     }
 }
@@ -152,9 +197,11 @@ async fn client(
     sa: SocketAddr,
     name: String,
     pco: PlayloadCommunicationOptions,
-    cs : ClientSettings,
+    cs: ClientSettings,
 ) -> Result<!> {
-    let bindaddr = if let Some(x) = pco.bind { x } else {
+    let bindaddr = if let Some(x) = pco.bind {
+        x
+    } else {
         if let Some(SocketAddr::V4(st)) = pco.sendto {
             if st.ip().is_loopback() {
                 "127.0.0.1:0".parse().unwrap()
@@ -170,7 +217,6 @@ async fn client(
     /// Socket for communicating with server
     let mut s = UdpSocket::bind("0.0.0.0:0".parse::<SocketAddr>().unwrap()).await?;
     s.connect(sa).await?;
-
 
     unimplemented!()
 }
