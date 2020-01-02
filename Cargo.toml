@@ -12,6 +12,8 @@ serde_cbor = "0.10.2"
 structopt = {default_features=false, version="0.3.7"}
 slab = "0.4.2"
 ttl_cache = "0.5.1"
+serde_yaml = "0.8.11"
+rand = "0.7.2"
 
 [dependencies.tokio]
 version="0.2.6"
@@ -22,4 +24,5 @@ features = [
     "udp",
     "time",
     "macros",
+    "sync",
 ]
