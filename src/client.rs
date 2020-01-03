@@ -40,17 +40,107 @@ enum CommunicationActorMessage {
     NewClientPeerAddress(SocketAddr),
 }
 
+#[derive(Default,Clone)]
+struct PortStatus {
+    last_seen_packet: Option<Instant>,
+    configured_peer_addr: Option<SocketAddr>,
+    seen_peer_addr: Option<SocketAddr>,
+}
+
 struct CommunicationActorState {
     ports: Vec<SendHalf>,
     client_tx: SendHalf,
     client_peer: Option<SocketAddr>,
+    port_statuses: Vec<PortStatus>,
+    max_norecv_time: Duration,
 }
 
 impl CommunicationActorState {
+    async fn try_send_though_port(&mut self, i : PortIndex, buf: &[u8]) -> Result<bool> {
+        
+        if self.port_statuses[i].last_seen_packet.is_none() {
+            return Ok(false);
+        }
+        let norecv = Instant::now().saturating_duration_since(self.port_statuses[i].last_seen_packet.unwrap());
+
+        if norecv > self.max_norecv_time {
+            return Ok(false);
+        }
+
+        match (self.port_statuses[i].configured_peer_addr, self.port_statuses[i].seen_peer_addr) {
+            (None, None) => Err("Strange that no address, yet seen packets")?,
+            (Some(x), None) | (None, Some(x)) => {
+                self.ports[i].send_to(buf, &x).await?;
+                Ok(true)
+            }
+            (Some(x), Some(y)) if x == y => {
+                self.ports[i].send_to(buf, &x).await?;
+                Ok(true)
+            }
+            (Some(x), Some(y)) => {
+                eprintln!("Different seen and configured addresses?");
+                self.ports[i].send_to(buf, &x).await?;
+                self.ports[i].send_to(buf, &y).await?;
+                Ok(true)
+            }
+        }
+    }
+
     async fn msg(&mut self, message: CommunicationActorMessage) -> Result<()> {
+        match message {
+            CommunicationActorMessage::ControlMessage(cm) => {
+                let ip : std::net::Ipv4Addr = (cm.ip ^ IP_MASK).into();
+                let maxusableports = self.ports.len().min(cm.ports.len());
+                for i in 0..maxusableports {
+                    let po = cm.ports[i] ^ PORT_MASK;
+                    let pa = SocketAddr::V4(std::net::SocketAddrV4::new(ip, po));
+                    self.port_statuses[i].configured_peer_addr = Some(pa);
+                    // Send a bubble to specified address
+                    self.ports[i].send_to(b"", &pa).await?;
+                }
+            },
+            CommunicationActorMessage::PortData(idx, buf, from) => {
+                self.port_statuses[idx].seen_peer_addr = Some(from);
+                self.port_statuses[idx].last_seen_packet = Some(Instant::now());
+                if ! buf.is_empty() {
+                    if let Some(claddr) = self.client_peer {
+                        let _ = self.client_tx.send_to(&buf[..], &claddr).await?;
+                    } else {
+                        eprintln!("No client available yet");
+                    }
+                }
+            },
+            CommunicationActorMessage::ClientData(buf) => {
+                use rand::Rng;
+                let mut rng = rand::thread_rng();
+
+                // Try sending though a random port
+                for _ in 0..4 {
+                    let i = rng.gen_range(0, self.ports.len());
+                    if self.try_send_though_port(i, &buf[..]).await? {
+                        return Ok(())
+                    }
+                }
+                // If failed, just try all ports sequentially
+                for i in 0..self.ports.len() {
+                    if self.try_send_though_port(i, &buf[..]).await? {
+                        return Ok(())
+                    }
+                }
+                // If still failed then we cannot relay anything now
+                Err("No usable ports to send now")?;
+            },
+            CommunicationActorMessage::NewClientPeerAddress(newaddr) => {
+                self.client_peer = Some(newaddr);
+            }
+        }
         Ok(())
     }
 }
+
+
+
+
 
 pub async fn client(
     server_addr: SocketAddr,
@@ -128,7 +218,7 @@ pub async fn client(
     let mut advertisment_b = serde_cbor::to_vec(&advertisment)?;
 
     // ----------
-    // Basic setup complete. Proceed to starting agents.
+    // Basic setup complete. Proceed to starting actors.
     // ----------
 
     let (mut client_rx, mut client_tx) = client.split();
@@ -138,7 +228,7 @@ pub async fn client(
     let (mut triggeradvsend, mut triggeradvsend_h) = channel::<()>(1);
     let mut triggeradvsend2 = triggeradvsend.clone();
 
-    let (mut commagent, mut commagent_h) = channel::<CommunicationActorMessage>(32);
+    let (mut commactor, mut commactor_h) = channel::<CommunicationActorMessage>(32);
 
     use unzip3::Unzip3;
     let (ports_tx, ports_rx, port_numbers): (Vec<SendHalf>, Vec<RecvHalf>, Vec<u16>) = ports
@@ -146,22 +236,24 @@ pub async fn client(
         .map(|pp| (pp.u_tx, pp.u_rx, pp.p))
         .unzip3();
 
-    /// Main, central agent:
-    let mut commagent_st = CommunicationActorState {
+    /// Main, central actor:
+    let mut commactor_st = CommunicationActorState {
         ports: ports_tx,
         client_tx,
         client_peer: sendaddr,
+        port_statuses: vec![Default::default(); port_numbers.len()],
+        max_norecv_time: Duration::from_secs(cs.keepalive_interval * 2),
     };
     tokio::spawn(async move {
-        while let Some(msg) = commagent_h.recv().await {
-            if let Err(e) = commagent_st.msg(msg).await {
+        while let Some(msg) = commactor_h.recv().await {
+            if let Err(e) = commactor_st.msg(msg).await {
                 eprintln!("Error: {}", e);
             }
         }
     });
     /// Data port receivers:
     for (i, mut u_rx) in ports_rx.into_iter().enumerate() {
-        let mut commagent = commagent.clone();
+        let mut commactor = commactor.clone();
         tokio::spawn(async move {
             loop {
                 let mut buf = [0u8; 2048];
@@ -172,7 +264,7 @@ pub async fn client(
                         continue;
                     }
                     Ok((len, from)) => {
-                        let _ = commagent
+                        let _ = commactor
                             .send(CommunicationActorMessage::PortData(
                                 i,
                                 buf[0..len].to_vec(),
@@ -186,7 +278,7 @@ pub async fn client(
     }
 
     /// Handler of messages from client
-    let mut commagent2 = commagent.clone();
+    let mut commactor2 = commactor.clone();
     tokio::spawn(async move {
         loop {
             let mut buf = [0u8; 2048];
@@ -208,10 +300,10 @@ pub async fn client(
                         // lax mode
                         if last_known_peeraddr != Some(from) {
                             last_known_peeraddr = Some(from);
-                            let _ = commagent2.send(CommunicationActorMessage::NewClientPeerAddress(from)).await;
+                            let _ = commactor2.send(CommunicationActorMessage::NewClientPeerAddress(from)).await;
                         }
                     }
-                    let _ = commagent2.send(CommunicationActorMessage::ClientData(buf[0..len].to_vec())).await;
+                    let _ = commactor2.send(CommunicationActorMessage::ClientData(buf[0..len].to_vec())).await;
                 }
             }
         }
@@ -241,16 +333,9 @@ pub async fn client(
                 let _ = triggeradvsend2.send(()).await;
             }
 
-            let _ = commagent
+            let _ = commactor
                 .send(CommunicationActorMessage::ControlMessage(msg))
                 .await;
-            //eprintln!("Incoming message from server: {:?}", msg);
-
-            //let peer_ip : std::net::Ipv4Addr = (msg.ip ^ IP_MASK).into();
-
-            //let usable_ports_n = msg.ports.len().min(ports.len());
-
-            //todo!();
         }
     });
 
