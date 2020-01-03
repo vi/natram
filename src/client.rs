@@ -113,11 +113,9 @@ impl CommunicationActorState {
             CommunicationActorMessage::ClientData(buf) => {
                 use rand::Rng;
 
-                let mut rng = rand::thread_rng();
-
                 // Try sending though a random port
                 for _ in 0..4 {
-                    let i = rng.gen_range(0, self.ports.len());
+                    let i = rand::thread_rng().gen_range(0, self.ports.len());
                     if self.try_send_though_port(i, &buf[..]).await? {
                         return Ok(())
                     }
