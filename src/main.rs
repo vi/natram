@@ -93,6 +93,7 @@ struct ServerMetrics {
     newnm: u64,
     sent: u64,
     snderr: u64,
+    lone: u64,
 }
 
 async fn server(sa: SocketAddr) -> Result<()> {
@@ -156,14 +157,19 @@ async fn server(sa: SocketAddr) -> Result<()> {
             .remove(&p.na)
             .unwrap_or_else(|| {metrics.newnm+=1; TtlCache::new(MAX_ADDRS)});
         // Broadcast this message (with filled in source address) to all other subscribed peers
+        let mut lone = true;
         for (x, ()) in addrs.iter() {
             if x == &from {
                 continue;
             }
+            lone = false;
             match u.send_to(&v[..], x).await {
                 Ok(_) => metrics.sent += 1,
                 Err(_) => metrics.snderr += 1,
             }
+        }
+        if lone {
+            metrics.lone += 1;
         }
 
         addrs.insert(from, (), Duration::from_secs(ADDR_EXPIRE_SECONDS));
