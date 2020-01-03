@@ -95,7 +95,7 @@ struct ServerMetrics {
     snderr: u64,
 }
 
-async fn server(sa: SocketAddr) -> Result<!> {
+async fn server(sa: SocketAddr) -> Result<()> {
     use ttl_cache::TtlCache;
 
     type Registry = TtlCache<String, TtlCache<SocketAddr, ()>>;
@@ -235,7 +235,7 @@ async fn main() -> Result<()> {
         if opt.cs.keepalive_interval != 30 {
             eprintln!("--keepalive-interval is meaningless in server mode");
         }
-        server(sa).await?
+        server(sa).await?;
     } else {
         if opt.name.is_none() {
             Err("--name is required in client mode")?;
@@ -246,6 +246,7 @@ async fn main() -> Result<()> {
         let name = opt.name.unwrap();
         let sa = opt.client.unwrap();
 
-        client::client(sa, name, opt.pco, opt.cs).await?
+        client::client(sa, name, opt.pco, opt.cs).await?;
     }
+    Ok(())
 }

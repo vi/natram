@@ -112,6 +112,7 @@ impl CommunicationActorState {
             },
             CommunicationActorMessage::ClientData(buf) => {
                 use rand::Rng;
+
                 let mut rng = rand::thread_rng();
 
                 // Try sending though a random port
@@ -147,7 +148,7 @@ pub async fn client(
     name: String,
     pco: PlayloadCommunicationOptions,
     cs: ClientSettings,
-) -> Result<!> {
+) -> Result<()> {
     let sendaddr = pco.sendto;
     let bindaddr = if let Some(x) = pco.bind {
         x
