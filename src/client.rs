@@ -186,14 +186,41 @@ pub async fn client(
     use rand::RngCore;
 
     loop {
-        let p: u16 = (rnd.next_u32() & 0xFFFF) as u16;
+        let mut p: u16 = (rnd.next_u32() & 0xFFFF) as u16;
         if p <= 1024 {
             continue;
         }
 
         let nullip = std::net::Ipv4Addr::UNSPECIFIED;
-        if let Ok(u) = UdpSocket::bind(SocketAddr::V4(std::net::SocketAddrV4::new(nullip, p))).await
+        if let Ok(mut u) = UdpSocket::bind(SocketAddr::V4(std::net::SocketAddrV4::new(nullip, p))).await
         {
+            if cs.stun {
+                let mut buf = [0u8; 2048];
+                loop {
+                    let ping_msg = serde_cbor::to_vec(&OutgoingControlMessage {
+                        na: "".to_string(),
+                        ports: vec![],
+                        disc: false,
+                    }).unwrap();
+
+                    u.send_to(&ping_msg[..], server_addr).await?;
+                    
+                    let ret = tokio::time::timeout(
+                        Duration::from_millis(250), 
+                        u.recv_from(&mut buf)).await;
+
+                    if let Ok(Ok((len,addr))) = ret {
+                        if addr == server_addr {
+                            let reply : IncomingControlMessage = serde_cbor::from_slice(&buf[0..len])?;
+                            let po = reply.po ^ PORT_MASK;
+                            println!("port {} maps to {}", p, po);
+                            p = po;
+                            break;
+                        }
+                    }
+                }
+            }
+
             let (u_rx, u_tx) = u.split();
             ports.push(Port { u_rx, u_tx, p });
         }

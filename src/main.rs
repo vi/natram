@@ -39,6 +39,10 @@ pub struct ClientSettings {
     /// Ignore received IP address, use this one instead
     #[structopt(long)]
     override_sendto_addr: Option<std::net::Ipv4Addr>,
+    
+    /// Resolve each port's mapped number (like in STUN) before processing
+    #[structopt(long, short = "S")]
+    stun: bool,
 }
 
 #[derive(StructOpt)]
