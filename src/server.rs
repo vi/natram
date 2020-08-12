@@ -50,7 +50,7 @@ pub async fn server(sa: SocketAddr) -> Result<()> {
             std::net::IpAddr::V4(a) => Into::<u32>::into(a) ^ IP_MASK,
             std::net::IpAddr::V6(_) => 0 ^ IP_MASK,
         });
-        p.po = Some(from.port() & PORT_MASK);
+        p.po = Some(from.port() ^ PORT_MASK);
         let v = serde_cbor::to_vec(&p)?;
 
         if p.na == "" {
