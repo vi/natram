@@ -35,6 +35,10 @@ pub struct ClientSettings {
     /// Number of ports to try
     #[structopt(long, default_value = "12")]
     num_ports: usize,
+
+    /// Ignore received IP address, use this one instead
+    #[structopt(long)]
+    override_sendto_addr: Option<std::net::Ipv4Addr>,
 }
 
 #[derive(StructOpt)]

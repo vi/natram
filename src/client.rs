@@ -53,6 +53,7 @@ struct CommunicationActorState {
     client_peer: Option<SocketAddr>,
     port_statuses: Vec<PortStatus>,
     max_norecv_time: Duration,
+    override_sendto_addr: Option<std::net::Ipv4Addr>,
 }
 
 impl CommunicationActorState {
@@ -89,7 +90,10 @@ impl CommunicationActorState {
     async fn msg(&mut self, message: CommunicationActorMessage) -> Result<()> {
         match message {
             CommunicationActorMessage::ControlMessage(cm) => {
-                let ip : std::net::Ipv4Addr = (cm.ip ^ IP_MASK).into();
+                let mut ip : std::net::Ipv4Addr = (cm.ip ^ IP_MASK).into();
+                if let Some(ovrip) = self.override_sendto_addr {
+                    ip = ovrip;
+                }
                 let maxusableports = self.ports.len().min(cm.ports.len());
                 for i in 0..maxusableports {
                     let po = cm.ports[i] ^ PORT_MASK;
@@ -242,6 +246,7 @@ pub async fn client(
         client_peer: sendaddr,
         port_statuses: vec![Default::default(); port_numbers.len()],
         max_norecv_time: Duration::from_secs(cs.keepalive_interval * 2),
+        override_sendto_addr: cs.override_sendto_addr,
     };
     tokio::spawn(async move {
         while let Some(msg) = commactor_h.recv().await {
